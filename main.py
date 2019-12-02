@@ -1,30 +1,39 @@
 import prometheus_client
+import prometheus_client.core
 import http.server as server
 import speedtest
 import argparse
+import logging
 
 
-def measure(args):
-    servers = args.servers
-    s = speedtest.Speedtest()
-    s.get_servers(servers)
-    s.get_best_server()
-    if not args.no_down:
-        s.download(threads=(None, 1)[args.single])
-    if not args.no_up:
-        s.upload(threads=(None, 1)[args.single])
-    results_dict = s.results.dict()
-    print(results_dict)
-    return results_dict
+class SpeedTest:
+    def __init__(self, args):
+        self.args = args
+
+    def measure(self):
+        servers = self.args.servers
+        s = speedtest.Speedtest()
+        s.get_servers(servers)
+        s.get_best_server()
+        if not self.args.no_down:
+            s.download(threads=(None, 1)[self.args.single])
+        if not self.args.no_up:
+            s.upload(threads=(None, 1)[self.args.single])
+        results_dict = s.results.dict()
+        print(results_dict)
+        logging.info("Measured: " + str(results_dict))
+        return results_dict
 
 
 def get_servers(list_all=False):
     s = speedtest.Speedtest()
     if not list_all:
+        logging.info("Getting closest servers")
         servers = s.get_closest_servers(20)
         for server in servers:
             print('%(id)s %(sponsor)s (%(name)s, %(country)s) [%(d)0.2f km]' % server)
     else:
+        logging.info("Getting all servers")
         s.get_servers()
         servers = s.servers
         for _, servers in sorted(servers.items()):
@@ -32,51 +41,55 @@ def get_servers(list_all=False):
                 print('%(id)s %(sponsor)s (%(name)s, %(country)s) [%(d)0.2f km]' % server)
 
 
-class MyHandler(prometheus_client.MetricsHandler):
-    down = prometheus_client.Gauge('stne_download', 'Download speed [bps]', ['server', 'connection'])
-    up = prometheus_client.Gauge('stne_upload', 'Upload speed [bps]', ['server', 'connection'])
-    ping = prometheus_client.Gauge('stne_ping', 'Ping [ms]', ['server', 'connection'])
-    sent = prometheus_client.Gauge('stne_sent', 'Sent [byte]', ['server', 'connection'])
-    received = prometheus_client.Gauge('stne_received', 'Received [byte]', ['server', 'connection'])
-    args = None
+class Collector(object):
+    def __init__(self, client=SpeedTest):
+        self.client = client
 
-    def do_GET(self):
-        result = measure(self.args)
-        server = "{}: {}".format(result['server']['id'], result['server']['sponsor'])
-        if self.args.single:
+    def collect(self):
+        results_dict = self.client.measure()
+        server = "{}: {}".format(results_dict['server']['id'], results_dict['server']['sponsor'])
+        if self.client.args.single:
             connection = 'Single'
         else:
             connection = 'Multiple'
-        self.down.labels(server, connection).set(result['download'])
-        self.received.labels(server, connection).set(result['bytes_received'])
-        if self.args.no_down:
-            self.down.remove(server, connection)
-            self.received.remove(server, connection)
-        self.up.labels(server, connection).set(result['upload'])
-        self.sent.labels(server, connection).set(result['bytes_sent'])
-        if self.args.no_up:
-            self.up.remove(server, connection)
-            self.sent.remove(server, connection)
-        self.ping.labels(server, connection).set(result['ping'])
 
-        prometheus_client.MetricsHandler.do_GET(self)
-        return
+        down = prometheus_client.core.GaugeMetricFamily('stne_download', 'Download speed [bps]',
+                                                        labels=['server', 'connection'])
+        down.add_metric([server, connection], results_dict['download'])
+        yield down
 
-    def set_args(self, args):
-        self.args = args
+        sent = prometheus_client.core.GaugeMetricFamily('stne_sent', 'Sent [byte]',
+                                                        labels=['server', 'connection'])
+        sent.add_metric([server, connection], results_dict['bytes_sent'])
+        yield sent
+
+        up = prometheus_client.core.GaugeMetricFamily('stne_upload', 'Upload speed [bps]',
+                                                      labels=['server', 'connection'])
+        up.add_metric([server, connection], results_dict['upload'])
+        yield up
+
+        received = prometheus_client.core.GaugeMetricFamily('stne_received', 'Received [byte]',
+                                                            labels=['server', 'connection'])
+        received.add_metric([server, connection], results_dict['bytes_received'])
+        yield received
+
+        ping = prometheus_client.core.GaugeMetricFamily('stne_ping', 'Ping [ms]',
+                                                        labels=['server', 'connection'])
+        ping.add_metric([server, connection], results_dict['ping'])
+        yield ping
 
 
-def start_server(args, server_class=server.ThreadingHTTPServer, handler_class=MyHandler):
+def start_server(args, server_class=server.ThreadingHTTPServer):
     server_address = (args.listen, args.port)
-    print("Starting http server at {}:{}".format(args.listen, args.port))
-    handler_class.set_args(handler_class, args)
-    httpd = server_class(server_address, handler_class)
+    prometheus_client.REGISTRY.register(Collector(SpeedTest(args)))
+    httpd = server_class(server_address, prometheus_client.MetricsHandler)
+    logging.info("Starting http server at {}:{}".format(args.listen, args.port))
     httpd.serve_forever()
 
 
 def main():
     parser = argparse.ArgumentParser(description='Speedtest exporter for Prometheus')
-    parser.add_argument('--listen', dest='listen', default='', nargs='?',
+    parser.add_argument('--listen', dest='listen', default='0.0.0.0', nargs='?',
                         help='Listen address for exporter (default: 0.0.0.0)')
     parser.add_argument('--port', dest='port', default='9591', nargs='?', type=int,
                         help='Port for exporter (default: 9591)')
@@ -94,8 +107,8 @@ def main():
                         help='Get list of all servers (default: False)')
     args = parser.parse_args()
 
-    print(args)
-
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.info("Started with following arguments: " + str(args))
     if args.list or args.list_all:
         if args.list_all:
             get_servers(True)
