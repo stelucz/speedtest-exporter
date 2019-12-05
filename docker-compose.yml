@@ -1,0 +1,10 @@
+version: '3.7'
+
+services:
+  stne:
+    build: .
+    image: stne:latest
+    restart: unless-stopped
+    command: --servers 21975 4468 --port 9591
+    ports: 
+      - "9591:9591"
